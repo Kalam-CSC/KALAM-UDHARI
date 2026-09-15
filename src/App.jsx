@@ -918,7 +918,7 @@ export default function App() {
 
                 <button
                   className={
-                    modal === "udari"
+                    modal === "udhari"
                       ? "save"
                       : "save green-bg"
                   }
