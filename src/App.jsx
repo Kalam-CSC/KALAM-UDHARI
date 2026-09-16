@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState } from "react";
 import "./App.css";
+import { supabase } from "./supabaseClient";
 
 const starterCustomers = [
   {
@@ -133,27 +134,7 @@ function getStatus(customer) {
 }
 
 export default function App() {
-  const [customers, setCustomers] = useState(() => {
-    try {
-      const saved = localStorage.getItem("kalam_udhari_customers");
-
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        return parsed.map((customer) => ({
-          ...customer,
-          mobile: customer.mobile || "",
-          entries: Array.isArray(customer.entries) ? customer.entries : [],
-        }));
-      }
-
-      return starterCustomers.map((customer) => ({
-        ...customer,
-        mobile: customer.mobile || "",
-      }));
-    } catch {
-      return starterCustomers;
-    }
-  });
+  const [customers, setCustomers] = useState([]);
 
   const [search, setSearch] = useState("");
 
@@ -171,12 +152,170 @@ export default function App() {
 
   const [editingEntryId, setEditingEntryId] = useState(null);
 
-  useEffect(() => {
-    localStorage.setItem(
-      "kalam_udhari_customers",
-      JSON.stringify(customers)
+  const [loading, setLoading] = useState(true);
+
+  const [saving, setSaving] = useState(false);
+
+  const [error, setError] = useState("");
+
+  function mapCustomerRow(customer, entries = []) {
+    return {
+      id: customer.id,
+      name: customer.name,
+      mobile: customer.mobile || "",
+      entries: entries
+        .filter((entry) => entry.customer_id === customer.id)
+        .map((entry) => ({
+          id: entry.id,
+          date: entry.date,
+          type: entry.type,
+          description: entry.description || "",
+          amount: Number(entry.amount || 0),
+        })),
+    };
+  }
+
+  async function loadData() {
+    setLoading(true);
+    setError("");
+
+    const [{ data: customerRows, error: customerError }, { data: entryRows, error: entryError }] =
+      await Promise.all([
+        supabase
+          .from("udhari_customers")
+          .select("id, name, mobile, created_at")
+          .order("created_at", { ascending: true }),
+        supabase
+          .from("udhari_entries")
+          .select("id, customer_id, date, type, description, amount, created_at")
+          .order("date", { ascending: true })
+          .order("created_at", { ascending: true }),
+      ]);
+
+    if (customerError || entryError) {
+      console.error("Supabase load error:", customerError || entryError);
+      setError("Supabase से data load नहीं हो पाया।");
+      setLoading(false);
+      return;
+    }
+
+    const dbCustomers = customerRows || [];
+    const dbEntries = entryRows || [];
+
+    // पहली बार Supabase खाली हो और पुराने browser में localStorage data हो,
+    // तो पुराने data को एक बार database में migrate कर दें।
+    if (dbCustomers.length === 0) {
+      try {
+        const saved = localStorage.getItem("kalam_udhari_customers");
+        const oldCustomers = saved ? JSON.parse(saved) : [];
+
+        if (Array.isArray(oldCustomers) && oldCustomers.length > 0) {
+          await migrateLocalData(oldCustomers);
+          await loadDataFromDatabase();
+          return;
+        }
+      } catch (migrationReadError) {
+        console.error("Local data read error:", migrationReadError);
+      }
+    }
+
+    setCustomers(
+      dbCustomers.map((customer) => mapCustomerRow(customer, dbEntries))
     );
-  }, [customers]);
+    setLoading(false);
+  }
+
+  async function loadDataFromDatabase() {
+    const [{ data: customerRows, error: customerError }, { data: entryRows, error: entryError }] =
+      await Promise.all([
+        supabase
+          .from("udhari_customers")
+          .select("id, name, mobile, created_at")
+          .order("created_at", { ascending: true }),
+        supabase
+          .from("udhari_entries")
+          .select("id, customer_id, date, type, description, amount, created_at")
+          .order("date", { ascending: true })
+          .order("created_at", { ascending: true }),
+      ]);
+
+    if (customerError || entryError) {
+      console.error("Supabase reload error:", customerError || entryError);
+      setError("Supabase से data reload नहीं हो पाया।");
+      setLoading(false);
+      return;
+    }
+
+    setCustomers(
+      (customerRows || []).map((customer) =>
+        mapCustomerRow(customer, entryRows || [])
+      )
+    );
+    setLoading(false);
+  }
+
+  async function migrateLocalData(oldCustomers) {
+    for (const oldCustomer of oldCustomers) {
+      const { data: newCustomer, error: customerError } = await supabase
+        .from("udhari_customers")
+        .insert({
+          name: String(oldCustomer.name || "").trim(),
+          mobile: String(oldCustomer.mobile || "").trim(),
+        })
+        .select("id")
+        .single();
+
+      if (customerError) {
+        throw customerError;
+      }
+
+      const oldEntries = Array.isArray(oldCustomer.entries)
+        ? oldCustomer.entries
+        : [];
+
+      if (oldEntries.length > 0) {
+        const entriesToInsert = oldEntries
+          .filter((entry) => Number(entry.amount) > 0)
+          .map((entry) => ({
+            customer_id: newCustomer.id,
+            date: convertDateToISO(entry.date),
+            type: entry.type === "jama" ? "jama" : "udhari",
+            description: String(entry.description || "").trim() || "उधारी",
+            amount: Number(entry.amount),
+          }));
+
+        if (entriesToInsert.length > 0) {
+          const { error: entryError } = await supabase
+            .from("udhari_entries")
+            .insert(entriesToInsert);
+
+          if (entryError) {
+            throw entryError;
+          }
+        }
+      }
+    }
+
+    localStorage.setItem("kalam_udhari_supabase_migrated", "1");
+  }
+
+  function convertDateToISO(value) {
+    if (!value) return new Date().toISOString().slice(0, 10);
+
+    const text = String(value);
+    if (/^\d{4}-\d{2}-\d{2}$/.test(text)) return text;
+
+    const match = text.match(/^(\d{2})-(\d{2})-(\d{4})$/);
+    if (match) {
+      return `${match[3]}-${match[2]}-${match[1]}`;
+    }
+
+    return new Date().toISOString().slice(0, 10);
+  }
+
+  useEffect(() => {
+    loadData();
+  }, []);
 
   const filteredCustomers = useMemo(() => {
     const query = search.trim().toLowerCase();
@@ -207,7 +346,7 @@ export default function App() {
   // NEW CUSTOMER
   // =========================
 
-  function addCustomer() {
+  async function addCustomer() {
     const cleanName = name.trim();
 
     if (!cleanName) {
@@ -216,21 +355,38 @@ export default function App() {
     }
 
     const cleanMobile = mobile.trim();
+    setSaving(true);
+    setError("");
+
+    const { data, error: insertError } = await supabase
+      .from("udhari_customers")
+      .insert({
+        name: cleanName,
+        mobile: cleanMobile,
+      })
+      .select("id, name, mobile, created_at")
+      .single();
+
+    setSaving(false);
+
+    if (insertError) {
+      console.error("Add customer error:", insertError);
+      setError("ग्राहक सेव नहीं हो पाया।");
+      alert("ग्राहक सेव नहीं हो पाया। Supabase connection/policy check करें।");
+      return;
+    }
 
     const newCustomer = {
-      id: Date.now(),
-      name: cleanName,
-      mobile: cleanMobile,
+      id: data.id,
+      name: data.name,
+      mobile: data.mobile || "",
       entries: [],
     };
 
     setCustomers((previous) => [...previous, newCustomer]);
-
     setName("");
     setMobile("");
-
     setModal(null);
-
     setSelectedId(newCustomer.id);
   }
 
@@ -243,7 +399,7 @@ export default function App() {
   }
 
   // =========================
-  // ADD UDHARI / JAMA
+  // ADD UDHARI / JAMA / EDIT
   // =========================
 
   function openEditEntry(entry) {
@@ -260,12 +416,10 @@ export default function App() {
     setModal(null);
   }
 
-  function addEntry() {
+  async function addEntry() {
     const value = Number(amount);
 
-    if (!selectedCustomer) {
-      return;
-    }
+    if (!selectedCustomer) return;
 
     if (!value || value <= 0) {
       alert("कृपया सही रकम लिखें।");
@@ -276,41 +430,92 @@ export default function App() {
       description.trim() ||
       (modal === "udhari" ? "उधारी" : "जमा");
 
-    setCustomers((previous) =>
-      previous.map((customer) => {
-        if (customer.id !== selectedCustomer.id) {
-          return customer;
-        }
+    setSaving(true);
+    setError("");
 
-        if (editingEntryId !== null) {
+    if (editingEntryId !== null) {
+      const { data, error: updateError } = await supabase
+        .from("udhari_entries")
+        .update({
+          type: modal,
+          description: cleanDescription,
+          amount: value,
+        })
+        .eq("id", editingEntryId)
+        .select("id, customer_id, date, type, description, amount")
+        .single();
+
+      setSaving(false);
+
+      if (updateError) {
+        console.error("Edit entry error:", updateError);
+        setError("Transaction edit नहीं हो पाया।");
+        alert("Transaction edit नहीं हो पाया।");
+        return;
+      }
+
+      setCustomers((previous) =>
+        previous.map((customer) => {
+          if (customer.id !== selectedCustomer.id) return customer;
+
           return {
             ...customer,
             entries: customer.entries.map((entry) =>
               entry.id === editingEntryId
                 ? {
                     ...entry,
-                    type: modal,
-                    description: cleanDescription,
-                    amount: value,
+                    type: data.type,
+                    description: data.description,
+                    amount: Number(data.amount),
                   }
                 : entry
             ),
           };
-        }
+        })
+      );
 
-        const newEntry = {
-          id: Date.now(),
-          date: today(),
-          type: modal,
-          description: cleanDescription,
-          amount: value,
-        };
+      closeEntryModal();
+      return;
+    }
 
-        return {
-          ...customer,
-          entries: [...customer.entries, newEntry],
-        };
+    const { data, error: insertError } = await supabase
+      .from("udhari_entries")
+      .insert({
+        customer_id: selectedCustomer.id,
+        date: new Date().toISOString().slice(0, 10),
+        type: modal,
+        description: cleanDescription,
+        amount: value,
       })
+      .select("id, customer_id, date, type, description, amount")
+      .single();
+
+    setSaving(false);
+
+    if (insertError) {
+      console.error("Add entry error:", insertError);
+      setError("Transaction सेव नहीं हुआ।");
+      alert("Transaction सेव नहीं हुआ।");
+      return;
+    }
+
+    const newEntry = {
+      id: data.id,
+      date: data.date,
+      type: data.type,
+      description: data.description,
+      amount: Number(data.amount),
+    };
+
+    setCustomers((previous) =>
+      previous.map((customer) =>
+        customer.id === selectedCustomer.id
+          ? {
+              ...customer,
+              entries: [...customer.entries, newEntry],
+            }
+          : customer
+      )
     );
 
     closeEntryModal();
@@ -320,20 +525,31 @@ export default function App() {
   // DELETE CUSTOMER
   // =========================
 
-  function deleteCustomer(id) {
-    const customer = customers.find(
-      (item) => item.id === id
-    );
+  async function deleteCustomer(id) {
+    const customer = customers.find((item) => item.id === id);
 
-    if (!customer) {
-      return;
-    }
+    if (!customer) return;
 
     const confirmDelete = window.confirm(
-      `${customer.name} को हटाना है?`
+      `${customer.name} को हटाना है?\n\nउसके सभी उधारी-जमा transactions भी हट जाएंगे।`
     );
 
-    if (!confirmDelete) {
+    if (!confirmDelete) return;
+
+    setSaving(true);
+    setError("");
+
+    const { error: deleteError } = await supabase
+      .from("udhari_customers")
+      .delete()
+      .eq("id", id);
+
+    setSaving(false);
+
+    if (deleteError) {
+      console.error("Delete customer error:", deleteError);
+      setError("ग्राहक delete नहीं हुआ।");
+      alert("ग्राहक delete नहीं हुआ।");
       return;
     }
 
@@ -362,28 +578,9 @@ export default function App() {
       ========================= */}
 
       <header className="header">
-
-        <div className="logo">
-          K
+        <div className="heading single-title">
+          <h1>KALAM UDHARI</h1>
         </div>
-
-        <div className="heading">
-
-          <h1>
-            KALAM CSC CENTER
-          </h1>
-
-          <div className="badge">
-            UDHARI
-          </div>
-
-          <p>
-            Simple Hisaab • Behtar Vyapar
-          </p>
-
-        </div>
-
-
       </header>
 
       {/* =========================
@@ -391,6 +588,12 @@ export default function App() {
       ========================= */}
 
       <main className="main">
+
+        {error && (
+          <div className="empty" style={{ marginBottom: "16px" }}>
+            {error}
+          </div>
+        )}
 
         {/* SUMMARY */}
 
@@ -441,6 +644,10 @@ export default function App() {
 
         <section className="card">
 
+          {loading ? (
+            <div className="empty">Data load हो रहा है...</div>
+          ) : (
+            <>
           <div className="table-head">
 
             <span>
@@ -517,6 +724,8 @@ export default function App() {
             <div className="empty">
               कोई ग्राहक नहीं मिला
             </div>
+          )}
+            </>
           )}
 
         </section>
@@ -854,8 +1063,9 @@ export default function App() {
                 <button
                   className="save"
                   onClick={addCustomer}
+                  disabled={saving}
                 >
-                  ग्राहक सेव करें
+                  {saving ? "सेव हो रहा है..." : "ग्राहक सेव करें"}
                 </button>
               </>
 
@@ -923,8 +1133,9 @@ export default function App() {
                       : "save green-bg"
                   }
                   onClick={addEntry}
+                  disabled={saving}
                 >
-                  {editingEntryId !== null ? "बदलाव सेव करें" : "सेव करें"}
+                  {saving ? "सेव हो रहा है..." : editingEntryId !== null ? "बदलाव सेव करें" : "सेव करें"}
                 </button>
 
               </>

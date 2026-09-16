@@ -43,14 +43,37 @@ button {
 /* ================= HEADER ================= */
 
 .header {
-  min-height: 105px;
+  min-height: 90px;
   background: linear-gradient(135deg, #123c72, #0a5aa5);
   color: #fff;
-  display: grid;
-  grid-template-columns: 120px 1fr 140px;
+  display: flex;
   align-items: center;
-  gap: 18px;
-  padding: 12px 28px;
+  justify-content: center;
+  padding: 14px 24px;
+  box-sizing: border-box;
+  text-align: center;
+}
+
+.single-title {
+  width: 100%;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
+
+.single-title h1 {
+  margin: 0;
+  padding: 8px 30px;
+  font-size: 30px;
+  font-weight: 800;
+  letter-spacing: 2px;
+  color: #123c72 !important;
+  background: linear-gradient(180deg, #ffffff, #dff2ff);
+  border: 2px solid #ffffff;
+  border-radius: 14px;
+  box-shadow:
+    0 0 10px rgba(255, 255, 255, 0.8),
+    0 4px 14px rgba(0, 0, 0, 0.18);
 }
 
 .logo {
